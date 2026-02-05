@@ -11,29 +11,50 @@ load_dotenv()
 # Multiple API keys (comma-separated in .env)
 API_KEYS = [key.strip() for key in os.getenv("GEMINI_API_KEY", "").split(",") if key.strip()]
 
-# Models to try in order (primary first, then fallback)
-PRIMARY_MODEL = "gemini-3-flash-preview"
-FALLBACK_MODEL = "gemma-3-27b-it"
+# Models to try in order of preference
+MODELS = ["gemini-3-flash-preview", "gemini-2.0-flash", "gemma-3-27b-it"]
 
 # Initialize clients for each API key
 clients = [genai.Client(api_key=key) for key in API_KEYS] if API_KEYS else []
 
 def extract_json(text: str) -> dict:
-    """Extract JSON from response that might have markdown formatting."""
+    """Extract JSON from response - handles various formats."""
+    if not text or not text.strip():
+        raise ValueError("Empty response")
+    
+    text = text.strip()
+    
+    # Direct JSON parse
     try:
         return json.loads(text)
     except:
         pass
     
-    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group(1))
+    # Find JSON in markdown code blocks
+    patterns = [
+        r'```json\s*(\{[\s\S]*?\})\s*```',
+        r'```\s*(\{[\s\S]*?\})\s*```',
+        r'(\{[\s\S]*?"decision"[\s\S]*?\})',
+    ]
     
-    json_match = re.search(r'\{[^{}]*"decision"[^{}]*\}', text, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group(0))
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except:
+                continue
     
-    raise ValueError("No valid JSON found")
+    # Last resort: find any JSON-like structure
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end+1])
+        except:
+            pass
+    
+    raise ValueError(f"No valid JSON found in: {text[:100]}...")
 
 def try_request(client, model: str, prompt: str, client_idx: int) -> RiskAssessment:
     """Try a single API request."""
@@ -41,18 +62,24 @@ def try_request(client, model: str, prompt: str, client_idx: int) -> RiskAssessm
     response = client.models.generate_content(
         model=model,
         contents=prompt,
-        config={"temperature": 0.1, "max_output_tokens": 300}
+        config={"temperature": 0.1, "max_output_tokens": 400}
     )
-    result_json = extract_json(response.text)
+    
+    raw_text = response.text
+    result_json = extract_json(raw_text)
+    
+    # Validate required fields
+    if "decision" not in result_json:
+        raise ValueError("Missing 'decision' field")
+    
     elapsed = time.time() - start
-    print(f"[Guardian AI] ✓ {model} (API {client_idx+1}) in {elapsed:.2f}s")
-    return RiskAssessment(**result_json)
+    assessment = RiskAssessment(**result_json)
+    print(f"[Guardian AI] ✓ {model} (API {client_idx+1}) in {elapsed:.2f}s: {assessment.decision}")
+    return assessment
 
 def analyze_message_risk(context: MessageContext) -> RiskAssessment:
     """
-    Analyze incoming message with sequential model fallback:
-    1. Try gemini-3-flash-preview with all API keys
-    2. If all fail, try gemma-3-27b-it with all API keys
+    Analyze message with sequential model fallback across all API keys.
     """
     if not clients:
         return RiskAssessment(
@@ -62,43 +89,38 @@ def analyze_message_risk(context: MessageContext) -> RiskAssessment:
             suggestions="Add GEMINI_API_KEY to .env"
         )
 
-    # Build prompt
-    links_str = "\n".join([f"  - {link}" for link in context.links]) if context.links else "  None"
-    files_str = "\n".join([f"  - {f.name} ({f.type})" for f in context.files]) if context.files else "  None"
+    # Build prompt - clearer instructions for JSON output
+    links_str = ", ".join(context.links) if context.links else "None"
+    files_str = ", ".join([f.name for f in context.files]) if context.files else "None"
 
-    prompt = f"""Analyze this message for phishing, malware, or scam threats.
+    prompt = f"""You are a security AI. Analyze this message and respond with ONLY valid JSON.
 
-SENDER: {context.sender}
-SUBJECT: {context.subject or "N/A"}
-BODY: {context.body}
-LINKS: {links_str}
-FILES: {files_str}
+Message:
+- From: {context.sender}
+- Subject: {context.subject or "N/A"}  
+- Content: {context.body[:500]}
+- Links: {links_str}
+- Files: {files_str}
 
-DECISION:
-- BLOCK (80-100): Clear phishing/scam - fake domain, credential request
-- WARN (40-70): Suspicious but possibly legitimate  
-- ALLOW (0-20): Safe message
+Respond with EXACTLY this JSON format (no other text):
+{{"decision": "ALLOW" or "WARN" or "BLOCK", "risk_score": 0-100, "confidence": 0.0-1.0, "risk_factors": ["list"], "reasoning": "brief reason", "suggestions": "action"}}
 
-JSON only:
-{{"decision": "ALLOW", "risk_score": 0, "confidence": 0.9, "risk_factors": [], "reasoning": "Safe", "suggestions": "None"}}"""
+Rules:
+- BLOCK: Fake domains (bankofamerica-secure.net), phishing, scams
+- WARN: Suspicious but unclear
+- ALLOW: Safe, legitimate messages"""
 
-    # Step 1: Try PRIMARY model (gemini-3-flash-preview) with all API keys
-    print(f"[Guardian AI] Trying {PRIMARY_MODEL}...")
-    for idx, client in enumerate(clients):
-        try:
-            return try_request(client, PRIMARY_MODEL, prompt, idx)
-        except Exception as e:
-            print(f"[Guardian AI] ✗ {PRIMARY_MODEL} (API {idx+1}): {str(e)[:40]}")
-            continue
-
-    # Step 2: PRIMARY failed with all APIs - Try FALLBACK model (gemma-3-27b-it)
-    print(f"[Guardian AI] Falling back to {FALLBACK_MODEL}...")
-    for idx, client in enumerate(clients):
-        try:
-            return try_request(client, FALLBACK_MODEL, prompt, idx)
-        except Exception as e:
-            print(f"[Guardian AI] ✗ {FALLBACK_MODEL} (API {idx+1}): {str(e)[:40]}")
-            continue
+    # Try each model with all API keys before moving to next model
+    for model in MODELS:
+        print(f"[Guardian AI] Trying {model}...")
+        for idx, client in enumerate(clients):
+            try:
+                return try_request(client, model, prompt, idx)
+            except Exception as e:
+                err_msg = str(e)[:50].replace('\n', ' ')
+                print(f"[Guardian AI] ✗ {model} (API {idx+1}): {err_msg}")
+                continue
+        print(f"[Guardian AI] {model} failed on all APIs, trying next model...")
 
     # All failed
     print("[Guardian AI] All models and APIs failed!")
