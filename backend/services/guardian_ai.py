@@ -12,7 +12,7 @@ load_dotenv()
 API_KEYS = [key.strip() for key in os.getenv("GEMINI_API_KEY", "").split(",") if key.strip()]
 
 # Models to try in order of preference
-MODELS = ["gemini-3-flash-preview", "gemini-2.0-flash", "gemma-3-27b-it"]
+MODELS = ["gemini-3-flash-preview", "gemma-3-27b-it"]
 
 # Initialize clients for each API key
 clients = [genai.Client(api_key=key) for key in API_KEYS] if API_KEYS else []
