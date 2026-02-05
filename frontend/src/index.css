@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+body {
+  background-color: #f0f2f5;
+  color: #111827;
+  font-family: 'Inter', sans-serif;
+}
+
+/* Slide-in animation for toast */
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.3s ease-out forwards;
+}
+
+/* Risky item indicator */
+.risky-item {
+  position: relative;
+  border-left: 3px solid #ef4444;
+  background: linear-gradient(90deg, rgba(254, 202, 202, 0.3) 0%, transparent 100%);
+}
+
+.risky-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #dc2626;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
