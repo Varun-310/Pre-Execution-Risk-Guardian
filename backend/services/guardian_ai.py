@@ -4,49 +4,66 @@ import re
 from google import genai
 from models import RiskAssessment, MessageContext
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+# Multiple API keys (comma-separated in .env)
+API_KEYS = [key.strip() for key in os.getenv("GEMINI_API_KEY", "").split(",") if key.strip()]
 
-# Initialize the new genai client
-client = genai.Client(api_key=API_KEY) if API_KEY else None
+# Models to try (in order of preference)
+MODELS = ["gemini-3-flash-preview", "gemma-3-27b-it"]
+
+# Initialize clients for each API key
+clients = [genai.Client(api_key=key) for key in API_KEYS] if API_KEYS else []
 
 def extract_json(text: str) -> dict:
     """Extract JSON from response that might have markdown formatting."""
-    # Try direct parse first
     try:
         return json.loads(text)
     except:
         pass
     
-    # Try to find JSON in markdown code blocks
     json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
     if json_match:
         return json.loads(json_match.group(1))
     
-    # Try to find raw JSON object
     json_match = re.search(r'\{[^{}]*"decision"[^{}]*\}', text, re.DOTALL)
     if json_match:
         return json.loads(json_match.group(0))
     
-    raise ValueError("No valid JSON found in response")
+    raise ValueError("No valid JSON found")
+
+def try_single_request(client, model: str, prompt: str) -> RiskAssessment:
+    """Try a single API request with specific client and model."""
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "temperature": 0.1,
+            "max_output_tokens": 300,
+        }
+    )
+    result_json = extract_json(response.text)
+    return RiskAssessment(**result_json)
 
 def analyze_message_risk(context: MessageContext) -> RiskAssessment:
     """
-    Analyze incoming message for security threats before user interaction.
+    Analyze incoming message with multi-API and model failover.
+    Tries all combinations in parallel for speed.
     """
-    if not client:
+    if not clients:
         return RiskAssessment(
             decision="WARN",
             risk_score=50,
             confidence=0.0,
             risk_factors=["Missing API Key"],
-            reasoning="Gemini API Key is missing.",
-            suggestions="Please add GEMINI_API_KEY to backend/.env"
+            reasoning="No Gemini API Key configured.",
+            suggestions="Add GEMINI_API_KEY to .env (comma-separated for multiple)"
         )
 
-    # Format links and files for the prompt
+    # Build the prompt
     links_str = "\n".join([f"  - {link}" for link in context.links]) if context.links else "  None"
     files_str = "\n".join([f"  - {f.name} ({f.type})" for f in context.files]) if context.files else "  None"
 
@@ -58,47 +75,52 @@ BODY: {context.body}
 LINKS: {links_str}
 FILES: {files_str}
 
-THREAT INDICATORS TO CHECK:
-1. Fake domains (e.g., "bankofamerica-secure.net" instead of "bankofamerica.com", "paypa1" with number 1)
-2. Urgency/fear tactics ("account suspended", "verify immediately")
-3. Suspicious file types (.exe, .bat, .scr, .zip from unknown sender)
-4. Request for credentials or personal info
+THREAT INDICATORS:
+1. Fake domains (bankofamerica-secure.net, paypa1.com with number 1)
+2. Urgency/fear tactics
+3. Suspicious files (.exe, .bat)
+4. Credential requests
 
 DECISION:
-- BLOCK (risk 80-100): Clear phishing/scam - fake domain, credential request, known scam pattern
-- WARN (risk 40-70): Suspicious elements but possibly legitimate
-- ALLOW (risk 0-20): Normal safe message
+- BLOCK (80-100): Clear phishing/scam
+- WARN (40-70): Suspicious but possibly legitimate
+- ALLOW (0-20): Safe message
 
-Respond with ONLY this JSON format, no other text:
-{{"decision": "ALLOW", "risk_score": 0, "confidence": 0.9, "risk_factors": [], "reasoning": "Safe message", "suggestions": "None needed"}}"""
+JSON only:
+{{"decision": "ALLOW", "risk_score": 0, "confidence": 0.9, "risk_factors": [], "reasoning": "Safe", "suggestions": "None"}}"""
 
-    try:
-        response = client.models.generate_content(
-            model="gemma-3-27b-it",
-            contents=prompt,
-            config={
-                "temperature": 0.1,
-                "max_output_tokens": 300,
-            }
-        )
+    # Try all API+model combinations in parallel
+    start = time.time()
+    
+    with ThreadPoolExecutor(max_workers=len(clients) * len(MODELS)) as executor:
+        futures = {}
         
-        raw_text = response.text
-        print(f"[Guardian AI] Raw: {raw_text[:100]}...")
+        # Submit all combinations
+        for client_idx, client in enumerate(clients):
+            for model in MODELS:
+                future = executor.submit(try_single_request, client, model, prompt)
+                futures[future] = (client_idx, model)
         
-        result_json = extract_json(raw_text)
-        assessment = RiskAssessment(**result_json)
-        
-        print(f"[Guardian AI] ✓ Decision: {assessment.decision}, Score: {assessment.risk_score}")
-        
-        return assessment
-        
-    except Exception as e:
-        print(f"[Guardian AI] ERROR: {str(e)}")
-        return RiskAssessment(
-            decision="WARN",
-            risk_score=50,
-            confidence=0.0,
-            risk_factors=["Analysis Error"],
-            reasoning=f"Could not complete analysis: {str(e)[:80]}",
-            suggestions="Proceed with caution."
-        )
+        # Return first successful result
+        for future in as_completed(futures, timeout=10):
+            client_idx, model = futures[future]
+            try:
+                result = future.result()
+                elapsed = time.time() - start
+                print(f"[Guardian AI] ✓ {model} (API {client_idx+1}) in {elapsed:.2f}s: {result.decision}")
+                return result
+            except Exception as e:
+                print(f"[Guardian AI] ✗ {model} (API {client_idx+1}): {str(e)[:50]}")
+                continue
+    
+    # All failed
+    elapsed = time.time() - start
+    print(f"[Guardian AI] All APIs failed in {elapsed:.2f}s")
+    return RiskAssessment(
+        decision="WARN",
+        risk_score=50,
+        confidence=0.0,
+        risk_factors=["API Error"],
+        reasoning="All API attempts failed. Please try again.",
+        suggestions="Proceed with caution."
+    )
