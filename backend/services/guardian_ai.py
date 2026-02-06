@@ -62,7 +62,7 @@ def try_request(client, model: str, prompt: str, client_idx: int) -> RiskAssessm
     response = client.models.generate_content(
         model=model,
         contents=prompt,
-        config={"temperature": 0.1, "max_output_tokens": 400}
+        config={"temperature": 0.1, "max_output_tokens": 200}
     )
     
     raw_text = response.text
@@ -93,22 +93,14 @@ def analyze_message_risk(context: MessageContext) -> RiskAssessment:
     links_str = ", ".join(context.links) if context.links else "None"
     files_str = ", ".join([f.name for f in context.files]) if context.files else "None"
 
-    prompt = f"""You are a security AI. Analyze this message and respond with ONLY valid JSON.
+    prompt = f"""Analyze for phishing/scams. Return ONLY valid JSON, no other text:
+{{"decision":"ALLOW/WARN/BLOCK","risk_score":0-100,"confidence":0.0-1.0,"risk_factors":["list"],"reasoning":"brief","suggestions":"action"}}
 
-Message:
-- From: {context.sender}
-- Subject: {context.subject or "N/A"}  
-- Content: {context.body[:500]}
-- Links: {links_str}
-- Files: {files_str}
+From: {context.sender} | Subject: {context.subject or "N/A"}
+Content: {context.body[:300]}
+Links: {links_str} | Files: {files_str}
 
-Respond with EXACTLY this JSON format (no other text):
-{{"decision": "ALLOW" or "WARN" or "BLOCK", "risk_score": 0-100, "confidence": 0.0-1.0, "risk_factors": ["list"], "reasoning": "brief reason", "suggestions": "action"}}
-
-Rules:
-- BLOCK: Fake domains (bankofamerica-secure.net), phishing, scams
-- WARN: Suspicious but unclear
-- ALLOW: Safe, legitimate messages"""
+BLOCK=phishing/fake domains/scams, WARN=suspicious, ALLOW=safe"""
 
     # Try each model with all API keys before moving to next model
     for model in MODELS:
